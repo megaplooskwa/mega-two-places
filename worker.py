@@ -267,7 +267,12 @@ class Model:
         if resp.status != 200:
             raise RuntimeError(f"openrouter HTTP {resp.status}: {mask(raw[:300])}")
         data = json.loads(raw)
-        return data["choices"][0]["message"]["content"]
+        choices = data.get("choices") or []
+        message = (choices[0].get("message") if choices else None) or {}
+        content = message.get("content")
+        if not isinstance(content, str) or not content.strip():
+            raise RuntimeError(f"the model returned no content (HTTP {resp.status}): {mask(raw[:400])}")
+        return content
 
 
 # --------------------------------------------------------------------------- procedures
@@ -484,7 +489,7 @@ def job1(mcp: Mcp, model: Model, skill: str, stop_before_submit: bool, log):
     return {"receipt": receipt, "result": redacted}
 
 
-def job2(mcp: Mcp, model: Model, skill: str, clip: str, stop_before_submit: bool, log):
+def job2(mcp: Mcp, model: Model, skill: str, clip: str, stop_before_submit: bool, log, state_path: str = ""):
     """transcribe -> memo_write per finding -> memo_search -> submit."""
     if not clip:
         raise RuntimeError("job2 needs the clip url (--clip)")
@@ -499,11 +504,14 @@ def job2(mcp: Mcp, model: Model, skill: str, clip: str, stop_before_submit: bool
 
     if not model.available:
         raise RuntimeError("job2 needs the model to read the transcript")
-    system = ("You read a transcript and list findings. A finding is anything that happened on a line: "
-              "a fault, a freeze or a stall, a hold, a reset - every time it happened, even when it repeats. "
-              "Talk around it is not a finding. Answer with JSON only: "
-              "{\"findings\": [{\"what\": \"<what happened>\", \"offset\": \"<m:ss from the list>\"}]}. "
-              "Use only offsets that appear in the list. One finding per entry, no duplicates.")
+    system = ("You read a transcript and list findings. A finding is anything that happened on a tram "
+              "line: a fault, a freeze or a stall, a hold, a reset - every time it happened, even when it "
+              "repeats. Talk around it is not a finding, and neither is anything that is not about a line "
+              "(a radio channel, a hand-over, the opening of the memo). "
+              "Answer with JSON only: {\"findings\": [{\"what\": \"<what happened, in the clip's own words, "
+              "with every time it says kept exactly as said and never converted between clocks>\", "
+              "\"offset\": \"<m:ss from the list>\"}]}. "
+              "One finding per entry, one offset per entry, every offset taken from the list, no duplicates.")
     user = ("The skill for this job:\n\n" + skill + "\n\nThe transcript, one segment per line as "
             "'<offset>\\t<text>':\n\n" + "\n".join(f"{s['offset']}\t{s['text']}" for s in segs))
     answer = model.ask(system, user, max_tokens=2000)
@@ -553,6 +561,11 @@ def job2(mcp: Mcp, model: Model, skill: str, clip: str, stop_before_submit: bool
     log("----------------------------------------")
     if stop_before_submit:
         log("stop-before-submit: not submitting")
+        if state_path:
+            pathlib.Path(state_path).write_text(json.dumps(
+                {"job": "job2", "token": token, "notes": notes, "clip": clip},
+                ensure_ascii=False, indent=1), encoding="utf-8")
+            log(f"state kept in {state_path} — resume to hand the notes in without writing them again")
         return {"stopped": True, "result": result}
 
     res = mcp.call_tool("submit", {"result": result, "skillVersion": "1", "step": token})
@@ -565,6 +578,35 @@ def job2(mcp: Mcp, model: Model, skill: str, clip: str, stop_before_submit: bool
 
 # --------------------------------------------------------------------------- main
 
+def job2_resume(mcp: Mcp, state_path: str, log):
+    """Continue a job-2 sequence that stopped before the hand-in: search, then submit."""
+    state = json.loads(pathlib.Path(state_path).read_text(encoding="utf-8"))
+    if state.get("job") != "job2":
+        raise RuntimeError(f"the state file is for {state.get('job')!r}, not job2")
+    token, notes = state.get("token", ""), state.get("notes", [])
+    if not token or not notes:
+        raise RuntimeError("the state file holds no step token or no notes")
+    log(f"resuming job2 with {len(notes)} notes")
+    res = mcp.call_tool("memo_search", {"step": token})
+    token = mcp.token_of(res) or token
+    stored = result_summary(res)
+    missing = [n for n in notes if n.split(" @")[0][:40] not in stored]
+    log(f"memo_search -> {len(stored)} chars; notes missing on the memo: {len(missing)}")
+    for n in missing:
+        res = mcp.call_tool("memo_write", {"text": n, "step": token})
+        token = mcp.token_of(res) or token
+        log(f"memo_write (missing) -> {mask(n)[:110]}")
+    result = "\n".join(notes)
+    log("--- the notes that will be handed in ---")
+    log(result)
+    log("----------------------------------------")
+    res = mcp.call_tool("submit", {"result": result, "skillVersion": "1", "step": token})
+    receipt = receipt_from(res)
+    log(f"submit -> {mask(result_summary(res))[:2000]}")
+    if not receipt:
+        raise RuntimeError("submit returned no receipt")
+    return {"receipt": receipt, "result": result}
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--job", choices=["job1", "job2"], required=True)
@@ -574,6 +616,8 @@ def main():
     ap.add_argument("--transcript", default="")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--stop-before-submit", action="store_true")
+    ap.add_argument("--state", default="")
+    ap.add_argument("--resume", action="store_true")
     args = ap.parse_args()
 
     lines = []
@@ -621,9 +665,12 @@ def main():
         elif args.job == "job1":
             out = job1(mcp, model, served_text or skill, args.stop_before_submit, log)
         else:
-            out = job2(mcp, model, served_text or skill, clip, args.stop_before_submit, log)
+            out = (job2_resume(mcp, args.state, log) if args.resume
+                   else job2(mcp, model, served_text or skill, clip, args.stop_before_submit, log, args.state))
     except Exception as exc:                                          # noqa: BLE001
+        import traceback
         log(f"FAILED: {type(exc).__name__}: {mask(str(exc))}")
+        log(mask(traceback.format_exc()[-1500:]))
         out = {"error": mask(str(exc))}
         code = 1
     else:
