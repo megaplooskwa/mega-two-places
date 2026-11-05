@@ -1,0 +1,36 @@
+name: job-1 incident-lookup (the far place)
+
+# Manual only. Nothing runs until someone asks for it, so a push never submits anything.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  job1:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: check out the worker
+        uses: actions/checkout@v4
+
+      - name: set up python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: run the worker on job 1
+        env:
+          JOB1_URL: ${{ secrets.JOB1_URL }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          OPENROUTER_MODEL: deepseek/deepseek-v4.1-flash
+        run: python worker.py --job job1 --transcript transcript-job1.json
+
+      - name: keep the record
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: job1-record
+          path: transcript-job1.json
+          if-no-files-found: warn
