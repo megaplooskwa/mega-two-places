@@ -3,6 +3,11 @@ name: job-1 incident-lookup (the far place)
 # Manual only. Nothing runs until someone asks for it, so a push never submits anything.
 on:
   workflow_dispatch:
+    inputs:
+      stop_before_submit:
+        description: "Follow the skill up to the redaction, but do not hand the job in"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -25,7 +30,9 @@ jobs:
           JOB1_URL: ${{ secrets.JOB1_URL }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           OPENROUTER_MODEL: deepseek/deepseek-v4.1-flash
-        run: python worker.py --job job1 --transcript transcript-job1.json
+        run: |
+          python worker.py --job job1 --transcript transcript-job1.json \
+            ${{ inputs.stop_before_submit && '--stop-before-submit' || '' }}
 
       - name: keep the record
         if: always()
