@@ -277,6 +277,24 @@ def result_summary(result) -> str:
     return txt if txt.strip() else json.dumps(result, ensure_ascii=False)[:2000]
 
 
+def flat_text(obj) -> str:
+    """Every string in a structure, joined: the whole record as text."""
+    out = []
+    if isinstance(obj, dict):
+        out = [flat_text(v) for v in obj.values()]
+    elif isinstance(obj, list):
+        out = [flat_text(v) for v in obj]
+    elif isinstance(obj, (str, int, float)):
+        out.append(str(obj))
+    return "\n".join(p for p in out if p)
+
+
+def payload_of(result):
+    """The JSON object a tool puts in its text content, when it is one."""
+    parsed = load_jsonish(deep_text(result))
+    return parsed if isinstance(parsed, dict) else None
+
+
 def entries_from(result) -> list:
     """Lift the entry list out of a search result, whatever shape it takes."""
     parsed = load_jsonish(deep_text(result)) or result
@@ -395,46 +413,61 @@ def job1(mcp: Mcp, model: Model, skill: str, stop_before_submit: bool, log):
 
     # the entry has to be the one about tram-3; the model may pick, code decides
     def mentions_tram3(e) -> bool:
-        return "tram-3" in deep_text(e).lower() or "tram‑3" in deep_text(e).lower()
+        return "tram-3" in flat_text(e).lower()
 
     candidates = [e for e in entries if mentions_tram3(e)] or entries
-    pick = ""
+    order = [entry_id(e) for e in candidates if entry_id(e)]
     if model.available:
         try:
-            listing = [{"id": entry_id(e), "text": deep_text(e)[:400]} for e in candidates]
+            listing = [{"id": entry_id(e), "text": flat_text(e)[:300]} for e in candidates]
             answer = model.ask(
-                "You pick one entry from a list. Answer with JSON only: {\"id\": \"<id>\"}.",
+                "You pick one entry from a list. Answer with that entry's id only, nothing else.",
                 "The entry we need is tram-3's incident record from the stall night.\n"
                 + json.dumps(listing, ensure_ascii=False))
-            got = (load_jsonish(answer) or {}).get("id", "")
-            if got and any(entry_id(e) == got for e in candidates):
-                pick = got
-                log(f"model picked entry {pick} (validated against the search result)")
+            got = (load_jsonish(answer) or {}).get("id") if answer.strip().startswith("{") else None
+            if not got:
+                m = re.search(r"[A-Za-z][A-Za-z0-9_\-]{2,}", answer)
+                got = m.group(0) if m else ""
+            if got and got in order:
+                order.remove(got)
+                order.insert(0, got)
+                log(f"model picked entry {got} (validated against the search result)")
             else:
                 log(f"model pick {mask(str(got))!r} not in the search result; using the code path")
         except Exception as exc:                                     # noqa: BLE001
             log(f"model unavailable for the pick ({mask(str(exc))}); using the code path")
-    if not pick:
-        pick = entry_id(candidates[0])
-        log(f"code picked entry {pick}")
-    if not pick:
+    if not order:
         raise RuntimeError("no usable entry id in the search result")
+    log(f"entry order: {order}")
 
-    res = mcp.call_tool("read", {"id": pick, "fields": FIELDS, "step": token})
-    token = mcp.token_of(res)
-    values = fields_from(res)
-    log(f"read({pick}) -> fields {sorted(values)}; token {'yes' if token else 'NO'}")
-    missing = [f for f in FIELDS if f not in values]
-    if missing:
-        raise RuntimeError(f"read did not return {missing}; refusing to hand in a partial record")
+    # read candidates until one really is a tram-3 record: a wrong entry cannot be handed in
+    values, pick = {}, ""
+    for candidate in order[:3]:
+        res = mcp.call_tool("read", {"id": candidate, "fields": FIELDS, "step": token})
+        token = mcp.token_of(res)
+        got = fields_from(res)
+        log(f"read({candidate}) -> fields {sorted(got)}; token {'yes' if token else 'NO'}")
+        missing = [f for f in FIELDS if f not in got]
+        if missing:
+            log(f"read({candidate}) is missing {missing}; trying the next candidate")
+            continue
+        if "tram-3" not in got["line"].lower():
+            log(f"read({candidate}) is line {got['line']!r}, not tram-3; trying the next candidate")
+            continue
+        values, pick = got, candidate
+        break
+    if not values:
+        raise RuntimeError("no candidate read back as a complete tram-3 record")
 
     text = "\n".join(f"{f}: {values[f]}" for f in FIELDS)
     res = mcp.call_tool("redact", {"text": text, "step": token})
     token = mcp.token_of(res)
-    redacted = result_summary(res).strip()
-    log(f"redact -> {len(redacted)} chars; token {'yes' if token else 'NO'}")
+    envelope = payload_of(res) or {}
+    redacted = (envelope.get("text") or "").strip()
     if not redacted:
-        raise RuntimeError("redact returned nothing")
+        log(f"redact returned no text field; full result: {mask(result_summary(res))[:800]}")
+        raise RuntimeError("redact returned nothing to hand in")
+    log(f"redact -> {len(redacted)} chars; token {'yes' if token else 'NO'}")
 
     log("--- the text that will be handed in ---")
     log(redacted)
@@ -445,7 +478,7 @@ def job1(mcp: Mcp, model: Model, skill: str, stop_before_submit: bool, log):
 
     res = mcp.call_tool("submit", {"result": redacted, "skillVersion": "1", "step": token})
     receipt = receipt_from(res)
-    log(f"submit -> {result_summary(res)[:600]}")
+    log(f"submit -> {mask(result_summary(res))[:2000]}")
     if not receipt:
         raise RuntimeError("submit returned no receipt")
     return {"receipt": receipt, "result": redacted}
@@ -524,7 +557,7 @@ def job2(mcp: Mcp, model: Model, skill: str, clip: str, stop_before_submit: bool
 
     res = mcp.call_tool("submit", {"result": result, "skillVersion": "1", "step": token})
     receipt = receipt_from(res)
-    log(f"submit -> {result_summary(res)[:600]}")
+    log(f"submit -> {mask(result_summary(res))[:2000]}")
     if not receipt:
         raise RuntimeError("submit returned no receipt")
     return {"receipt": receipt, "result": result}
@@ -597,9 +630,9 @@ def main():
         code = 0
 
     if args.transcript:
-        pathlib.Path(args.transcript).write_text(
-            json.dumps({"job": args.job, "log": lines, "outcome": out, "transcript": transcript},
-                       indent=1, ensure_ascii=False), encoding="utf-8")
+        record = json.dumps({"job": args.job, "log": lines, "outcome": out,
+                             "transcript": transcript}, indent=1, ensure_ascii=False)
+        pathlib.Path(args.transcript).write_text(mask(record), encoding="utf-8")
     if isinstance(out, dict) and out.get("receipt"):
         print("RECEIPT " + out["receipt"], flush=True)
         if args.transcript:

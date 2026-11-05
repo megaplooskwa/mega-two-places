@@ -40,4 +40,5 @@ jobs:
         with:
           name: job1-record
           path: transcript-job1.json
+          retention-days: 1
           if-no-files-found: warn
